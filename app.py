@@ -1,7 +1,7 @@
 import os, io, time, hashlib, base64, urllib.parse, random, string, hmac as _hmac
 from flask import Flask, request, jsonify
 from flask_cors import CORS
-import requests, numpy as np
+import requests, face_recognition, numpy as np
 from supabase import create_client
 
 app = Flask(__name__)
@@ -15,15 +15,6 @@ SB_URL = os.environ.get('SB_URL', 'https://svvtypqcwaxzbubuysmu.supabase.co')
 SB_KEY = os.environ.get('SB_KEY', '')
 
 sb = create_client(SB_URL, SB_KEY) if SB_KEY else None
-
-# Importar deepface lazy (demora um pouco na primeira vez)
-_deepface = None
-def get_deepface():
-    global _deepface
-    if _deepface is None:
-        from deepface import DeepFace
-        _deepface = DeepFace
-    return _deepface
 
 def pct(s):
     return urllib.parse.quote(str(s), safe='')
@@ -45,8 +36,7 @@ def oauth_header(method, url, params={}):
     key  = f'{pct(CS)}&{pct(TS)}'.encode()
     sig  = base64.b64encode(_hmac.new(key, base.encode(), hashlib.sha1).digest()).decode()
     op['oauth_signature'] = sig
-    header = 'OAuth ' + ', '.join(f'{pct(k)}="{pct(v)}"' for k, v in sorted(op.items()))
-    return header
+    return 'OAuth ' + ', '.join(f'{pct(k)}="{pct(v)}"' for k, v in sorted(op.items()))
 
 def smug_get(path, params={}):
     url  = f'https://api.smugmug.com{path}'
@@ -57,19 +47,13 @@ def smug_get(path, params={}):
     r.raise_for_status()
     return r.json()
 
-def get_face_descriptor(img_url):
+def get_face_descriptor_from_url(img_url):
     try:
-        DeepFace = get_deepface()
         r = requests.get(img_url, timeout=15)
-        from PIL import Image
-        img = Image.open(io.BytesIO(r.content)).convert('RGB')
-        # Salvar temporariamente
-        tmp = f'/tmp/face_{random.randint(1000,9999)}.jpg'
-        img.save(tmp)
-        result = DeepFace.represent(img_path=tmp, model_name='Facenet', enforce_detection=True)
-        os.remove(tmp)
-        if result:
-            return result[0]['embedding']
+        img = face_recognition.load_image_file(io.BytesIO(r.content))
+        encs = face_recognition.face_encodings(img, num_jitters=1, model='small')
+        if encs:
+            return encs[0].tolist()
     except Exception as e:
         print(f'Sem rosto em {img_url}: {e}')
     return None
@@ -103,7 +87,7 @@ def processar_album():
             thumb    = img.get('ThumbnailUrl', '')
             web_uri  = img.get('WebUri', '')
             filename = img.get('FileName', '')
-            desc = get_face_descriptor(thumb)
+            desc = get_face_descriptor_from_url(thumb)
             if desc:
                 row = {'evento_id': ev_id, 'album_key': key, 'image_key': img_key,
                        'filename': filename, 'thumb_url': thumb, 'web_url': web_uri, 'descriptor': desc}
@@ -122,8 +106,10 @@ def buscar():
     data       = request.json
     desc_aluno = np.array(data.get('descriptor', []))
     album_key  = data.get('album_key')
-    threshold  = float(data.get('threshold', 10.0))  # Facenet usa distância ~10
+    threshold  = float(data.get('threshold', 0.52))
 
+    if desc_aluno.shape != (128,):
+        return jsonify({'erro': 'descriptor invalido'}), 400
     if not album_key or not sb:
         return jsonify({'erro': 'album_key ou Supabase nao configurado'}), 400
 
@@ -142,6 +128,22 @@ def buscar():
     matched.sort(key=lambda x: x['distancia'])
     return jsonify({'fotos': matched, 'total': len(matched)})
 
+@app.route('/descriptor', methods=['POST'])
+def get_descriptor():
+    data = request.json
+    img_b64 = data.get('image')
+    if not img_b64:
+        return jsonify({'erro': 'image obrigatorio'}), 400
+    try:
+        img_bytes = base64.b64decode(img_b64.split(',')[-1])
+        img = face_recognition.load_image_file(io.BytesIO(img_bytes))
+        encs = face_recognition.face_encodings(img, num_jitters=1, model='small')
+        if encs:
+            return jsonify({'descriptor': encs[0].tolist()})
+        return jsonify({'erro': 'Nenhum rosto detectado'}), 400
+    except Exception as e:
+        return jsonify({'erro': str(e)}), 400
+
 @app.route('/status-album', methods=['GET'])
 def status_album():
     key = request.args.get('key')
@@ -149,28 +151,6 @@ def status_album():
         return jsonify({'processadas': 0})
     count = sb.table('fotomatch_descritores').select('image_key', count='exact').eq('album_key', key).execute()
     return jsonify({'processadas': count.count or 0})
-
-@app.route('/descriptor', methods=['POST'])
-def get_descriptor():
-    """Aluno envia imagem base64, servidor retorna o descritor facial."""
-    data = request.json
-    img_b64 = data.get('image')
-    if not img_b64:
-        return jsonify({'erro': 'image obrigatorio'}), 400
-    try:
-        from PIL import Image
-        img_bytes = base64.b64decode(img_b64.split(',')[-1])
-        img = Image.open(io.BytesIO(img_bytes)).convert('RGB')
-        tmp = f'/tmp/aluno_{random.randint(1000,9999)}.jpg'
-        img.save(tmp)
-        DeepFace = get_deepface()
-        result = DeepFace.represent(img_path=tmp, model_name='Facenet', enforce_detection=True)
-        os.remove(tmp)
-        if result:
-            return jsonify({'descriptor': result[0]['embedding']})
-        return jsonify({'erro': 'Nenhum rosto detectado'}), 400
-    except Exception as e:
-        return jsonify({'erro': str(e)}), 400
 
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5000))
